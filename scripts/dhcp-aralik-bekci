@@ -1,0 +1,63 @@
+#!/bin/sh
+# =====================================================================
+# dhcp-aralik-bekci - Acilis yaris durumu duzeltmesi
+#
+# Sorun: Acilista dnsmasq, bir ag arayuzu (ornegin Wi-Fi koprusu) gecici
+# olarak hazir degilken baslarsa o ag icin DHCP araligini (dhcp-range)
+# olusturmaz ve kendini guncellemez. O aga yeni baglanan cihazlar IP
+# alamaz (169.254.x.x). Log: "no address range available for DHCP request"
+#
+# Bu betik cron ile dakikada bir calisir. DHCP'si acik, arayuzu ayakta ve
+# statik IP'li her ag icin, CALISAN dnsmasq ayarinda aralik var mi bakar.
+# Eksikse dnsmasq'i yeniden baslatir (5 dk icinde en fazla 1 kez).
+#
+# Kurulum  : sh dhcp-aralik-bekci-kur.sh
+# Test     : sh dhcp-aralik-bekci --test   (sadece rapor, degisiklik yok)
+# Kaldirma : sh dhcp-aralik-bekci-kur.sh --kaldir
+# =====================================================================
+RESTART="${RESTART:-/etc/init.d/dnsmasq restart}"
+S=/tmp/dhcp-aralik-bekci.son
+TEST=0; [ "$1" = "--test" ] && TEST=1
+
+. /lib/functions/network.sh
+[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq enabled || { [ $TEST = 1 ] && echo "dnsmasq kurulu/etkin degil - atlandi"; exit 0; }
+# IPv4 DHCP'yi odhcpd veriyorsa dnsmasq'in araligi olmaz; kontrol gereksiz
+[ "$(uci -q get dhcp.odhcpd.maindhcp)" = "1" ] && { [ $TEST = 1 ] && echo "IPv4 DHCP sunucusu odhcpd - atlandi"; exit 0; }
+pidof dnsmasq >/dev/null || { [ $TEST = 1 ] && echo "dnsmasq calismiyor"; exit 0; }
+
+# Calisan dnsmasq'in kullandigi ayar dosyasi (-C). /var/etc altindaki yarim
+# kalmis gecici dosyalar (dnsmasq.conf.cfgXXXX.PID) yaniltici olabilir.
+if [ -z "$CONF" ]; then
+	CONF=$(for p in $(pidof dnsmasq); do tr '\000' '\n' < /proc/$p/cmdline | grep -A1 '^-C$' | tail -1; done | grep -m1 '^/var/etc/')
+fi
+[ -n "$CONF" ] && [ -f "$CONF" ] || { [ $TEST = 1 ] && echo "calisan ayar dosyasi bulunamadi"; exit 0; }
+[ $TEST = 1 ] && echo "Calisan ayar: $CONF"
+
+eksik=""
+for sec in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.=]*\)=dhcp$/\1/p"); do
+	iface=$(uci -q get dhcp.$sec.interface); [ -n "$iface" ] || continue
+	[ "$(uci -q get dhcp.$sec.ignore)" = "1" ] && continue
+	[ "$(uci -q get dhcp.$sec.dhcpv4)" = "disabled" ] && continue
+	network_is_up "$iface" || continue
+	network_get_protocol p "$iface"; [ "$p" = "static" ] || continue
+	network_get_subnet s "$iface" || continue
+	tag=$(uci -q get dhcp.$sec.networkid); [ -n "$tag" ] || tag="$iface"
+	if grep -qs "^dhcp-range=set:$tag," "$CONF"; then
+		[ $TEST = 1 ] && echo "  [ OK ] $iface ($s)"
+	else
+		[ $TEST = 1 ] && echo "  [EKSIK] $iface ($s)"
+		eksik="$eksik $iface"
+	fi
+done
+
+[ -z "$eksik" ] && exit 0
+[ $TEST = 1 ] && { echo "Eksik aralik:$eksik (test modu: dnsmasq yeniden baslatilmadi)"; exit 0; }
+
+now=$(cut -d. -f1 /proc/uptime)
+if [ -f $S ] && [ $((now - $(cat $S))) -lt 300 ]; then
+	logger -t dhcp-aralik-bekci "DHCP araligi hala eksik:$eksik ; 5 dk dolmadan tekrar denenmeyecek"
+	exit 0
+fi
+echo "$now" > $S
+logger -t dhcp-aralik-bekci "DHCP araligi eksik:$eksik ; dnsmasq yeniden baslatiliyor"
+$RESTART
